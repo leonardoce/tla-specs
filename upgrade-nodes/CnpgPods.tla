@@ -4,43 +4,25 @@
 \* cluster, without scheduling them.
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
+
 LOCAL INSTANCE KubernetesTypes
+LOCAL INSTANCE CnpgTypes
 
-CONSTANT clusterName, size, unblockDrainWithPromotionEnabled, unblockDrainWithDeletionEnabled
+CONSTANT clusterName, size
 VARIABLE podList, nodeList, cnpgStatus, nodeGroupStatus, pc
-
-ASSUME unblockDrainWithPromotionEnabled \in BOOLEAN
-ASSUME unblockDrainWithDeletionEnabled \in BOOLEAN
 
 vars == <<podList, nodeList, cnpgStatus, nodeGroupStatus>>
 
 PodNameOf(i) == clusterName \o "-" \o ToString(i)
 ExpectedPodNames == {PodNameOf(i) : i \in 1..size}
-CnpgStatus == [primary: ExpectedPodNames \cup {""}]
-
-\* Internal: generate the labels used by a CNPG Pod depending
-\* on it being a primary or not
-cnpgLabels(primary) == {
-    [name |-> "role", value |-> IF primary THEN "primary" ELSE "replica"]
-  }
 
 \* Internal: generate a new Pod info for a CNPG pod
 newPodInfo(name, primary) == 
   [
     name |-> name,
     nodeName |-> "",
-    labels |-> cnpgLabels(primary)
+    labels |-> CnpgLabels(primary)
   ]
-
-\* Internal: mark a podInfo as primary
-markPrimary(info) == [info EXCEPT !.labels=cnpgLabels(TRUE)]
-
-\* Internal: mark a podInfo as replica
-markReplica(info) == [info EXCEPT !.labels=cnpgLabels(FALSE)]
-
-\* This checks whether a PodInfo belongs to a CNPG primary Pod
-PodIsPrimary(pod) == \E label \in pod.labels : label.name="role" /\ label.value="primary"
-PodIsReplica(pod) == ~PodIsPrimary(pod)
 
 ------------------------------------------------
 
@@ -64,47 +46,12 @@ AutoswitchWhenPrimaryCordoned ==
         /\ PodIsReplica(replicaPod)
         /\ PodIsScheduledOnCordonedNode(primaryPod, nodeList)
         /\ PodIsScheduledOnNotCordonedNode(replicaPod, nodeList)
-        /\ podList' = (podList \ {primaryPod, replicaPod}) \cup {markReplica(primaryPod), markPrimary(replicaPod)}
+        /\ podList' = (podList \ {primaryPod, replicaPod}) \cup {MarkReplica(primaryPod), MarkPrimary(replicaPod)}
         /\ cnpgStatus' = [primary |-> replicaPod.name]
         /\ pc' = "AutoswitchWhenPrimaryCordoned"
         /\ UNCHANGED <<nodeGroupStatus, nodeList>>
 
-\* Unblocks a node being drained if every node where CNPG is running is
-\* cordoned and the primary is being drained. It does that by promoting
-\* a random replica.
-UnblockDrainAllNodesCordonedWithPromotion ==
-  /\ unblockDrainWithPromotionEnabled
-  /\ nodeGroupStatus.drainList /= <<>>
-  /\ \A node \in nodeList, pod \in podList : pod.nodeName=node.name => node.cordoned
-  /\ \E primaryPod, replicaPod \in podList : 
-      /\ PodIsPrimary(primaryPod)
-      /\ PodIsReplica(replicaPod)
-      /\ PodIsScheduledOnCordonedNode(replicaPod, nodeList)
-      /\ primaryPod.nodeName=Head(nodeGroupStatus.drainList).name
-      /\ podList' = (podList \ {primaryPod, replicaPod}) \cup {markReplica(primaryPod), markPrimary(replicaPod)}
-      /\ cnpgStatus' = [primary |-> replicaPod.name]
-      /\ pc' = "UnblockDrainAllNodesCordonedWithPromotion"
-      /\ UNCHANGED <<nodeGroupStatus, nodeList>>
-
-\* Unblocks a node being drained if every node where CNPG is running is
-\* cordoned and the primary is being drained. It does that by removing
-\* a random replica.
-UnblockDrainAllNodesCordonedWithDeletion ==
-  /\ unblockDrainWithDeletionEnabled
-  /\ nodeGroupStatus.drainList /= <<>>
-  /\ ~ENABLED CreatePod
-  /\ ~ENABLED AutoswitchWhenPrimaryCordoned
-  /\ \A pod \in podList : pod.nodeName /= ""
-  /\ \A node \in nodeList, pod \in podList : pod.nodeName=node.name => node.cordoned
-  /\ \E replicaPod \in podList : 
-      /\ PodIsReplica(replicaPod)
-      /\ podList' = (podList \ {replicaPod})
-      /\ pc' = "UnblockDrainAllNodesCordonedWithDeletion"
-      /\ UNCHANGED <<nodeGroupStatus, nodeList, cnpgStatus>>
-
 Next == \/ CreatePod
-        \/ UnblockDrainAllNodesCordonedWithPromotion
-        \/ UnblockDrainAllNodesCordonedWithDeletion
         \/ AutoswitchWhenPrimaryCordoned
 
 ------------------------------------------------
